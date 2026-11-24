@@ -1,0 +1,241 @@
+{% macro icon(name) -%}
+<i class="icon icon-{{ name }}" aria-hidden="true"></i>
+{%- endmacro %}
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZooKeeper 节点管理</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script type="module" src="{{ url_for('static', filename='app.js') }}"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">{{ icon("network") }}</span>
+      <h1>ZooKeeper</h1>
+      <span class="brand-divider"></span>
+      <span class="brand-label">节点管理</span>
+    </div>
+    <div class="connection-controls">
+      <span id="connection-hosts" class="endpoint mono" hidden></span>
+      <span id="connection-status" class="status-pill" role="status">未连接</span>
+      <button id="open-connection" class="button primary" type="button">
+        {{ icon("plug") }}<span id="connection-caption">连接服务器</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="explorer" aria-labelledby="explorer-title">
+      <div class="explorer-heading">
+        <h2 id="explorer-title">节点浏览器</h2>
+        <button id="refresh-tree" class="icon-button" type="button" aria-label="刷新节点列表" title="刷新节点列表" disabled>
+          {{ icon("refresh-cw") }}
+        </button>
+      </div>
+      <form id="search-form" class="search-form" role="search">
+        <div class="search-field">
+          {{ icon("search") }}
+          <input id="query" type="text" aria-label="搜索名称或路径" placeholder="搜索名称或路径" autocomplete="off" maxlength="1024" disabled>
+          <button id="clear-search" class="icon-button" type="button" aria-label="清除搜索" title="清除搜索" hidden>
+            {{ icon("x") }}
+          </button>
+          <button id="submit-search" class="icon-button search-submit" type="submit" aria-label="搜索节点" title="搜索节点" disabled>
+            {{ icon("arrow-right") }}
+          </button>
+        </div>
+        <label class="leaf-filter"><input id="leaves" type="checkbox" disabled> 仅叶节点</label>
+      </form>
+      <div class="navigation-title">
+        <span id="navigation-label">节点树</span>
+        <span id="navigation-count" aria-live="polite"></span>
+      </div>
+      <div id="navigation" class="navigation"></div>
+    </aside>
+
+    <section class="detail" aria-label="节点详情">
+      <div id="empty-detail" class="empty-detail">
+        <span id="empty-icon" class="empty-icon">{{ icon("plug") }}</span>
+        <h2 id="empty-heading">尚未连接</h2>
+        <p id="empty-message" class="muted" hidden></p>
+        <button id="retry-detail" class="button" type="button" hidden>
+          {{ icon("refresh-cw") }}重新读取
+        </button>
+      </div>
+      <article id="node-detail" class="node-detail" hidden>
+        <div class="detail-header">
+          <div class="detail-title">
+            <div class="node-heading">
+              <span id="node-kind" class="node-kind"></span>
+              <h2 id="node-name"></h2>
+            </div>
+            <div class="node-path">
+              <span id="node-path" class="mono"></span>
+              <button id="copy-path" class="icon-button" type="button" aria-label="复制节点路径" title="复制节点路径">
+                {{ icon("copy") }}
+              </button>
+              <button id="locate-node" class="icon-button" type="button" aria-label="在树中定位" title="在树中定位">
+                {{ icon("locate-fixed") }}
+              </button>
+            </div>
+          </div>
+          <div class="node-actions">
+            <button id="refresh-node" class="icon-button outlined" type="button" aria-label="重新读取节点" title="重新读取节点">
+              {{ icon("refresh-cw") }}
+            </button>
+            <button id="open-create" class="button" type="button">
+              {{ icon("plus") }}新建子节点
+            </button>
+            {% if directory_import %}
+            <button id="open-import" class="button" type="button" disabled>
+              {{ icon("folder-up") }}导入目录
+            </button>
+            {% endif %}
+            <button id="open-delete" class="icon-button outlined danger" type="button" aria-label="删除节点" title="删除节点">
+              {{ icon("trash-2") }}
+            </button>
+          </div>
+        </div>
+
+        <dl class="node-meta">
+          <div><dt>版本</dt><dd id="meta-version" class="mono"></dd></div>
+          <div><dt>数据大小</dt><dd id="meta-size" class="mono"></dd></div>
+          <div><dt>子节点</dt><dd id="meta-children" class="mono"></dd></div>
+          <div><dt>最后修改</dt><dd id="meta-modified"></dd></div>
+        </dl>
+
+        <form id="editor" class="editor">
+          <div class="editor-toolbar">
+            <h3><label for="node-value">节点数据</label></h3>
+            <fieldset class="segmented" aria-label="节点数据编码">
+              <label><input type="radio" name="node-encoding" value="utf8" checked><span>UTF-8</span></label>
+              <label><input type="radio" name="node-encoding" value="base64"><span>Base64</span></label>
+            </fieldset>
+          </div>
+          <textarea id="node-value" class="mono" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="空数据"></textarea>
+          <div class="editor-footer">
+            <span id="editor-status" class="muted" role="status"></span>
+            <div class="editor-actions">
+              <button id="reset-node" class="icon-button outlined" type="button" aria-label="撤销编辑" title="撤销编辑" disabled>
+                {{ icon("undo-2") }}
+              </button>
+              <button id="save-node" class="button primary" type="submit" disabled>
+                {{ icon("save") }}保存
+              </button>
+            </div>
+          </div>
+        </form>
+      </article>
+    </section>
+  </main>
+
+  <dialog id="connection-dialog" aria-labelledby="connection-dialog-title">
+    <form id="connection-form">
+      <div class="dialog-header">
+        <h2 id="connection-dialog-title">连接 ZooKeeper</h2>
+        <button class="icon-button" type="button" data-close="connection-dialog" aria-label="关闭" title="关闭">{{ icon("x") }}</button>
+      </div>
+      <div class="dialog-body">
+        <label class="field">服务器地址
+          <input id="hosts" class="mono" type="text" value="127.0.0.1:2181" placeholder="127.0.0.1:2181" required maxlength="2048" spellcheck="false" autocomplete="off" autofocus>
+        </label>
+        <details id="auth-options" class="auth-options">
+          <summary>{{ icon("key-round") }} Digest 认证</summary>
+          <div class="credentials">
+            <label class="field">用户名<input id="username" type="text" autocomplete="username"></label>
+            <label class="field">密码<input id="password" type="password" autocomplete="off"></label>
+          </div>
+        </details>
+        <p id="connection-error" class="form-error" role="alert" hidden></p>
+      </div>
+      <div class="dialog-footer">
+        <button id="disconnect" class="button danger disconnect" type="button" hidden>
+          {{ icon("unplug") }}断开
+        </button>
+        <button class="button" type="button" data-close="connection-dialog">取消</button>
+        <button id="connect" class="button primary" type="submit">{{ icon("plug") }}<span id="connect-label">连接</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="create-dialog" aria-labelledby="create-dialog-title">
+    <form id="create-form">
+      <div class="dialog-header">
+        <h2 id="create-dialog-title">新建子节点</h2>
+        <button class="icon-button" type="button" data-close="create-dialog" aria-label="关闭" title="关闭">{{ icon("x") }}</button>
+      </div>
+      <div class="dialog-body">
+        <div class="field">父节点 <span id="create-parent" class="path-preview mono"></span></div>
+        <label class="field">节点名<input id="create-name" type="text" required autocomplete="off" spellcheck="false" autofocus></label>
+        <div class="editor-toolbar">
+          <label for="create-value">初始数据</label>
+          <select id="create-encoding" aria-label="初始数据编码">
+            <option value="utf8">UTF-8</option>
+            <option value="base64">Base64</option>
+          </select>
+        </div>
+        <textarea id="create-value" class="mono create-value" placeholder="空数据" spellcheck="false"></textarea>
+        <p id="create-error" class="form-error" role="alert" hidden></p>
+      </div>
+      <div class="dialog-footer">
+        <button class="button" type="button" data-close="create-dialog">取消</button>
+        <button id="create-submit" class="button primary" type="submit">{{ icon("plus") }}创建</button>
+      </div>
+    </form>
+  </dialog>
+
+  {% if directory_import %}
+  <dialog id="import-dialog" aria-labelledby="import-dialog-title">
+    <form id="import-form">
+      <div class="dialog-header">
+        <h2 id="import-dialog-title">导入目录</h2>
+        <button class="icon-button" type="button" data-close="import-dialog" aria-label="关闭" title="关闭">{{ icon("x") }}</button>
+      </div>
+      <div class="dialog-body">
+        <label class="field">目标父节点
+          <input id="import-parent" class="mono" type="text" required autocomplete="off" spellcheck="false">
+        </label>
+        <div class="import-source">
+          <button id="choose-folder" class="button" type="button" autofocus>{{ icon("folder-open") }}选择目录</button>
+          <input id="import-files" type="file" webkitdirectory multiple hidden>
+          <span id="import-source" class="muted" role="status"></span>
+        </div>
+        <div id="import-target" class="field" hidden>
+          导入路径 <span id="import-path" class="path-preview mono"></span>
+          <span class="muted import-policy">同名文件节点将更新为所选文件的内容。</span>
+        </div>
+        <p id="import-error" class="form-error" role="alert" hidden></p>
+      </div>
+      <div class="dialog-footer">
+        <button class="button" type="button" data-close="import-dialog">取消</button>
+        <button id="import-submit" class="button primary" type="submit" disabled>
+          {{ icon("folder-up") }}<span id="import-caption">导入</span>
+        </button>
+      </div>
+    </form>
+  </dialog>
+  {% endif %}
+
+  <dialog id="delete-dialog" aria-labelledby="delete-dialog-title">
+    <form id="delete-form">
+      <div class="dialog-header">
+        <h2 id="delete-dialog-title">删除节点？</h2>
+        <button class="icon-button" type="button" data-close="delete-dialog" aria-label="关闭" title="关闭">{{ icon("x") }}</button>
+      </div>
+      <div class="dialog-body">
+        <div id="delete-path" class="path-preview mono"></div>
+        <p class="muted">删除后无法恢复节点数据。</p>
+        <p id="delete-error" class="form-error" role="alert" hidden></p>
+      </div>
+      <div class="dialog-footer">
+        <button class="button" type="button" data-close="delete-dialog" autofocus>取消</button>
+        <button id="delete-submit" class="button destructive" type="submit">{{ icon("trash-2") }}删除</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="notification" class="notification" role="status" hidden></div>
+</body>
+</html>
