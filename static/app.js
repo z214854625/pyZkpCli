@@ -2,6 +2,8 @@
 
 const $ = (id) => document.getElementById(id);
 const connectionDialog = $("connection-dialog");
+const hostsInput = $("hosts");
+const historySelect = $("connection-history");
 const createDialog = $("create-dialog");
 const importDialog = $("import-dialog");
 const deleteDialog = $("delete-dialog");
@@ -22,7 +24,8 @@ const messages = {
   connection_unavailable: "ZooKeeper 暂时不可用，请检查连接。",
   node_missing: "节点已不存在。",
   node_exists: "父节点下已有同名节点。",
-  node_not_empty: "节点仍有子节点，请先删除子节点。",
+  node_not_empty: "节点仍有子节点，请重新读取节点后再试。",
+  delete_path_too_large: "节点路径过长，超出 ZooKeeper 单个事务的大小上限。",
   ephemeral_parent: "临时节点不能创建子节点。",
   version_conflict: "节点数据已被修改，请重新读取节点后再试。",
   permission_denied: "当前 ZooKeeper 身份无权执行此操作。",
@@ -30,7 +33,8 @@ const messages = {
   protected_path: "此节点受到保护，无法执行该操作。",
   invalid_name: "请输入单层节点名，名称不能包含 /。",
   invalid_path: "节点路径不符合 ZooKeeper 格式。",
-  invalid_data: "数据格式无效，请检查 UTF-8 或 Base64 内容。",
+  invalid_data: "数据格式无效，请检查所选编码和内容。",
+  invalid_text: "当前数据无法按所选编码显示为文本。",
   invalid_version: "节点版本无效，请重新读取节点。",
   data_too_large: "数据过大，最多支持 1 MiB。",
   timeout: "ZooKeeper 请求超时，请稍后重试。",
@@ -45,17 +49,21 @@ const messages = {
 };
 
 let connection = { id: null, state: "disconnected" };
+let recentHosts = [];
+let hostsEdited = false;
 let connectionBusy = false;
 let statusRequest = 0;
 let selectedPath = null;
 let detailRequest = 0;
 let node = null;
+let encodingNode = null;
 let editingEncoding = "utf8";
 let originalValue = "";
 let draftValue = "";
 let lineEndingSource = "";
 let mutationBusy = false;
 let directoryImport = null;
+let deleteTarget = null;
 let searchState = null;
 let notificationTimer;
 
@@ -84,7 +92,8 @@ async function api(route, { method = "GET", parameters, body } = {}) {
       cache: "no-store",
     });
   } catch {
-    throw new Error(method === "GET" || route === "connection" ? "network_error" : "write_unconfirmed");
+    const localRequest = method === "GET" || route === "connection" || route === "node/encoding";
+    throw new Error(localRequest ? "network_error" : "write_unconfirmed");
   }
   const data = await response.json();
   if (!response.ok) {
@@ -124,6 +133,7 @@ function allowDiscard() {
 function updateControls() {
   const canRead = connected() && !connectionBusy && !mutationBusy;
   const canEdit = canRead && node !== null && !node.protected;
+  const converting = node !== null && encodingNode === node;
   $("open-connection").disabled = connectionBusy || mutationBusy;
   $("refresh-tree").disabled = !canRead;
   $("refresh-node").disabled = !canRead;
@@ -131,14 +141,17 @@ function updateControls() {
   $("locate-node").disabled = !canRead;
   $("query").disabled = !canRead;
   $("leaves").disabled = !canRead;
+  $("search-leaf-hint").hidden = $("leaves").checked;
   $("submit-search").disabled = !canRead || !($("query").value.trim() || $("leaves").checked);
   $("open-create").disabled = !canEdit || node.ephemeral;
-  $("open-delete").disabled = !canEdit || node.path === "/" || node.num_children > 0;
-  $("open-delete").title = node?.num_children ? "请先删除子节点" : "删除节点";
-  valueInput.readOnly = !canEdit;
-  for (const input of editor.elements["node-encoding"]) input.disabled = !canRead;
-  $("save-node").disabled = !canEdit || !dirty();
-  $("reset-node").disabled = !canEdit || !dirty();
+  const deleteButton = $("open-delete");
+  deleteButton.disabled = !canEdit || node.path === "/";
+  deleteButton.title = node?.num_children ? "删除子树" : "删除节点";
+  deleteButton.setAttribute("aria-label", deleteButton.title);
+  valueInput.readOnly = !canEdit || converting;
+  for (const input of editor.elements["node-encoding"]) input.disabled = !canRead || converting;
+  $("save-node").disabled = !canEdit || converting || !dirty();
+  $("reset-node").disabled = !canEdit || converting || !dirty();
   if (importDialog) {
     $("open-import").disabled = !canEdit || node.ephemeral;
     $("import-submit").disabled = !canRead || !directoryImport?.source || !importDialog.open
@@ -157,6 +170,11 @@ function showEmpty(title, iconName, message = "", retry = false) {
   updateControls();
 }
 
+function prefillHosts() {
+  const hosts = connection.hosts ?? recentHosts[0] ?? hostsInput.defaultValue;
+  if (hostsInput.value !== hosts) hostsInput.value = hosts;
+}
+
 function applyConnection(next) {
   const changed = next.id !== connection.id;
   const wasConnected = connected();
@@ -167,6 +185,15 @@ function applyConnection(next) {
   setMessage($("connection-hosts"), connection.hosts ?? "");
   $("connection-hosts").title = connection.hosts ?? "";
   $("connection-caption").textContent = connection.id ? "连接设置" : "连接服务器";
+  if (next.history && (next.history.length !== recentHosts.length
+      || next.history.some((hosts, index) => hosts !== recentHosts[index]))) {
+    recentHosts = next.history;
+    historySelect.replaceChildren(new Option("最近连接", ""), ...recentHosts.map((hosts) => new Option(hosts, hosts)));
+    historySelect.hidden = recentHosts.length === 0;
+  }
+  $("recent-connection-host").textContent = recentHosts[0] ?? "";
+  $("recent-connection").hidden = Boolean(connection.id) || !recentHosts.length;
+  if (!hostsEdited) prefillHosts();
   if (changed) {
     if (dirty()) notify("连接已切换，当前编辑已结束。", true);
     for (const dialog of [createDialog, importDialog, deleteDialog]) if (dialog?.open) dialog.close();
@@ -313,22 +340,29 @@ function renderNavigation() {
   const focus = document.activeElement;
   const hadFocus = navigation.contains(focus) && focus.dataset.action;
   const tree = list();
-  $("navigation-label").textContent = searchState ? "搜索结果" : "节点树";
-  $("navigation-count").textContent = searchState ? `${searchState.results.length} 项` : "";
+  const search = searchState;
+  let count = "";
+  $("navigation-label").textContent = search ? "搜索结果" : "节点树";
   const root = entries.get("/");
-  if (searchState) {
-    for (const result of searchState.results) tree.append(searchItem(result));
-    if (searchState.loading) tree.append(treeMessage("正在搜索…"));
-    else if (searchState.error) tree.append(treeMessage(searchState.error));
-    else if (!searchState.results.length && !searchState.after) tree.append(treeMessage("未找到匹配节点"));
-    if (searchState.inaccessible) {
-      tree.append(treeMessage(`${searchState.inaccessible} 个节点的子节点列表无法访问`));
+  if (search) {
+    for (const result of search.results) tree.append(searchItem(result));
+    if (search.loading) tree.append(treeMessage("正在搜索…"));
+    else if (search.error) tree.append(treeMessage(search.error));
+    else if (!search.results.length && !search.after) tree.append(treeMessage("未找到匹配节点"));
+    if (search.results.length || (!search.loading && !search.error && !search.after)) {
+      count = `${search.results.length} 项`;
+    } else if (search.scanned) {
+      count = `已检查 ${search.scanned} 个节点`;
+    }
+    if (search.inaccessible) {
+      tree.append(treeMessage(`${search.inaccessible} 个节点的子节点列表无法访问`));
     }
   } else if (root) {
     tree.append(treeItem(root));
   }
+  $("navigation-count").textContent = count;
   navigation.replaceChildren(tree);
-  if (searchState && !searchState.loading && searchState.after) {
+  if (search && !search.loading && search.after) {
     const more = document.createElement("button");
     more.type = "button";
     more.className = "button more-results";
@@ -357,25 +391,36 @@ function clearSearch() {
 
 async function runSearch(append = false) {
   if (!connected() || mutationBusy) return;
-  const q = $("query").value.trim();
-  const leaves = $("leaves").checked ? "1" : "0";
-  if (!q && leaves === "0") {
-    clearSearch();
-    return;
+  if (!append) {
+    const q = $("query").value.trim();
+    const leaves = $("leaves").checked ? "1" : "0";
+    if (!q && leaves === "0") {
+      clearSearch();
+      return;
+    }
+    searchState = {
+      q, leaves, root: selectedPath ?? "/", results: [], after: null, scanned: 0, inaccessible: 0,
+    };
   }
-  if (!append) searchState = { results: [], after: null, inaccessible: 0, q, leaves };
   const search = searchState;
+  if (!search || search.loading || (append && !search.after)) return;
   search.loading = true;
   search.error = "";
   $("clear-search").hidden = false;
   renderNavigation();
   try {
-    const parameters = { q: search.q, leaves: search.leaves };
-    if (search.after !== null) parameters.after = search.after;
-    const results = await api("search", { parameters });
-    search.results.push(...results.nodes);
-    search.after = results.after;
-    search.inaccessible += results.inaccessible;
+    while (searchState === search && connected()) {
+      const parameters = { q: search.q, leaves: search.leaves, root: search.root };
+      if (search.after !== null) parameters.after = search.after;
+      const page = await api("search", { parameters });
+      if (searchState !== search) return;
+      search.results.push(...page.nodes);
+      search.after = page.after;
+      search.scanned += page.scanned;
+      search.inaccessible += page.inaccessible;
+      if (page.nodes.length || !search.after) break;
+      renderNavigation();
+    }
   } catch (error) {
     search.error = messageFor(error);
   } finally {
@@ -423,7 +468,7 @@ function setEncoding(encoding) {
 function setEditorValue(value) {
   valueInput.value = value;
   draftValue = value;
-  lineEndingSource = editingEncoding === "utf8" && value.includes("\r") ? value : "";
+  lineEndingSource = editingEncoding !== "base64" && value.includes("\r") ? value : "";
 }
 
 function restoreLineEndings(value, source) {
@@ -454,7 +499,7 @@ function restoreLineEndings(value, source) {
 function renderNode() {
   if (node.encoding === "base64") {
     try {
-      node.value = convertEncoding(node.value, "base64", "utf8");
+      node.value = decodeUtf8Base64(node.value);
       node.encoding = "utf8";
     } catch {
       // Older running backends can report CRLF text as Base64.
@@ -506,12 +551,28 @@ function encodeBytes(bytes) {
   return btoa(binary);
 }
 
-function convertEncoding(value, from, to) {
+async function convertEncoding(value, from, to) {
   if (from === to) return value;
+  if (from === "gbk" || to === "gbk") {
+    const result = await api("node/encoding", {
+      method: "POST",
+      body: { value, encoding: from, target_encoding: to },
+    });
+    return result.value;
+  }
   if (to === "base64") return encodeBytes(new TextEncoder().encode(value));
-  const bytes = Uint8Array.from(atob(value.replace(/\s+/g, "")), (character) => character.charCodeAt(0));
-  const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-  if (/[\u0000-\u0008\u000b-\u000c\u000e-\u001f\u007f-\u009f]/.test(text)) throw new Error("invalid_data");
+  return decodeUtf8Base64(value);
+}
+
+function decodeUtf8Base64(value) {
+  let text;
+  try {
+    const bytes = Uint8Array.from(atob(value.replace(/\s+/g, "")), (character) => character.charCodeAt(0));
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    throw new Error("invalid_text");
+  }
+  if (/[\u0000-\u0008\u000b-\u000c\u000e-\u001f\u007f-\u009f]/.test(text)) throw new Error("invalid_text");
   return text;
 }
 
@@ -524,7 +585,7 @@ function setDialogBusy(dialog, busy) {
 async function changeConnection(disconnect) {
   if (connectionBusy || !allowDiscard()) return;
   const payload = {
-    hosts: $("hosts").value,
+    hosts: hostsInput.value,
     username: $("auth-options").open ? $("username").value : "",
     password: $("auth-options").open ? $("password").value : "",
   };
@@ -538,6 +599,7 @@ async function changeConnection(disconnect) {
     const next = await api("connection", { method: disconnect ? "DELETE" : "POST", body: payload });
     connectionDialog.close();
     applyConnection(next);
+    if (next.history_save_failed) notify("已连接，但连接历史保存失败。", true);
   } catch (error) {
     setMessage($("connection-error"), messageFor(error));
   } finally {
@@ -549,7 +611,7 @@ async function changeConnection(disconnect) {
   }
 }
 
-async function changeNode(method, payload, dialog, errorElement, onSuccess) {
+async function changeNode(method, payload, dialog, errorElement, onSuccess, formatError = messageFor) {
   const expectedId = connection.id;
   mutationBusy = true;
   updateControls();
@@ -562,8 +624,8 @@ async function changeNode(method, payload, dialog, errorElement, onSuccess) {
     onSuccess(result);
   } catch (error) {
     if (expectedId === connection.id) {
-      if (errorElement) setMessage(errorElement, messageFor(error));
-      else notify(messageFor(error), true);
+      if (errorElement) setMessage(errorElement, formatError(error));
+      else notify(formatError(error), true);
     }
   } finally {
     mutationBusy = false;
@@ -583,11 +645,23 @@ for (const dialog of [connectionDialog, createDialog, importDialog, deleteDialog
 connectionDialog.addEventListener("close", () => { $("password").value = ""; });
 
 $("open-connection").addEventListener("click", () => {
-  if (connection.hosts) $("hosts").value = connection.hosts;
+  hostsEdited = false;
+  prefillHosts();
+  historySelect.value = "";
   $("auth-options").open = false;
   $("disconnect").hidden = !connection.id;
   setMessage($("connection-error"), "");
   connectionDialog.showModal();
+  void pollStatus();
+});
+hostsInput.addEventListener("input", () => {
+  hostsEdited = true;
+  historySelect.value = "";
+});
+historySelect.addEventListener("change", () => {
+  if (!historySelect.value) return;
+  hostsEdited = true;
+  hostsInput.value = historySelect.value;
 });
 $("connection-form").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -603,7 +677,10 @@ $("search-form").addEventListener("submit", (event) => {
   event.preventDefault();
   void runSearch();
 });
-$("leaves").addEventListener("change", () => { void runSearch(); });
+$("leaves").addEventListener("change", () => {
+  updateControls();
+  void runSearch();
+});
 $("clear-search").addEventListener("click", () => {
   clearSearch();
   $("query").focus();
@@ -650,25 +727,36 @@ valueInput.addEventListener("input", () => {
   draftValue = lineEndingSource ? restoreLineEndings(value, lineEndingSource) : value;
   updateEditor();
 });
-editor.addEventListener("change", (event) => {
-  if (event.target.name !== "node-encoding") return;
+editor.addEventListener("change", async (event) => {
+  if (event.target.name !== "node-encoding" || node === null || encodingNode === node) return;
   const next = event.target.value;
-  let value;
+  const current = node;
+  const wasDirty = dirty();
+  encodingNode = current;
+  setEncoding(editingEncoding);
+  updateControls();
   try {
-    value = convertEncoding(draftValue, editingEncoding, next);
-  } catch {
-    setEncoding(editingEncoding);
-    notify("当前数据无法转换为 UTF-8 文本。", true);
-    return;
+    const value = await convertEncoding(draftValue, editingEncoding, next);
+    if (node !== current) return;
+    let original = value;
+    if (wasDirty) {
+      try {
+        original = await convertEncoding(current.value, current.encoding, next);
+      } catch (error) {
+        if (error.message !== "invalid_text") throw error;
+        original = null;
+      }
+    }
+    if (node !== current) return;
+    originalValue = original;
+    setEncoding(next);
+    setEditorValue(value);
+  } catch (error) {
+    if (node === current) notify(messageFor(error), true);
+  } finally {
+    if (encodingNode === current) encodingNode = null;
+    if (node === current) updateEditor();
   }
-  try {
-    originalValue = convertEncoding(node.value, node.encoding, next);
-  } catch {
-    originalValue = null;
-  }
-  setEncoding(next);
-  setEditorValue(value);
-  updateEditor();
 });
 $("reset-node").addEventListener("click", renderNode);
 editor.addEventListener("submit", (event) => {
@@ -892,26 +980,51 @@ $("import-form")?.addEventListener("submit", (event) => {
 });
 
 $("open-delete").addEventListener("click", () => {
-  $("delete-path").textContent = node.path;
+  const recursive = node.num_children > 0;
+  deleteTarget = { path: node.path, version: node.version, recursive };
+  $("delete-dialog-title").textContent = recursive ? "删除子树？" : "删除节点？";
+  $("delete-path").textContent = deleteTarget.path;
+  $("delete-warning").textContent = recursive
+    ? "将删除此节点及其下的全部节点，删除后无法恢复。"
+    : "删除后无法恢复节点数据。";
+  $("delete-caption").textContent = recursive ? "删除子树" : "删除";
   setMessage($("delete-error"), "");
   deleteDialog.showModal();
 });
-$("delete-form").addEventListener("submit", (event) => {
+$("delete-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (mutationBusy || !connected()) return;
-  const payload = { path: node.path, version: node.version };
-  void changeNode("DELETE", payload, deleteDialog, $("delete-error"), ({ path }) => {
+  if (mutationBusy || !connected() || !deleteDialog.open) return;
+  const caption = $("delete-caption");
+  const label = caption.textContent;
+  caption.textContent = "正在删除…";
+  await changeNode("DELETE", deleteTarget, deleteDialog, $("delete-error"), ({ path, deleted }) => {
+    const isDeleted = (candidate) => candidate === path || candidate.startsWith(`${path}/`);
     const parentPath = path.slice(0, path.lastIndexOf("/")) || "/";
     const parent = entries.get(parentPath);
     if (parent) {
       parent.children = parent.children?.filter((entry) => entry.path !== path) ?? null;
       void loadChildren(parent);
     }
-    entries.delete(path);
-    if (searchState) searchState.results = searchState.results.filter((result) => result.path !== path);
+    for (const candidate of entries.keys()) {
+      if (isDeleted(candidate)) entries.delete(candidate);
+    }
+    if (searchState) {
+      searchState = {
+        ...searchState,
+        results: searchState.results.filter((result) => !isDeleted(result.path)),
+        loading: false,
+      };
+    }
     void selectNode(parentPath);
-    notify("节点已删除");
+    notify(deleted > 1 ? `已删除 ${deleted} 个节点` : "节点已删除");
+  }, (error) => {
+    const path = error.details?.path;
+    const location = path ? `（${path}）` : "";
+    const deleted = error.details?.deleted;
+    const progress = deleted ? `已删除 ${deleted} 个节点，请刷新节点树。` : "";
+    return `${location}${messageFor(error)}${progress}`;
   });
+  caption.textContent = label;
 });
 
 updateControls();

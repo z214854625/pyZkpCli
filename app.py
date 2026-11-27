@@ -1,24 +1,32 @@
 import argparse
 import atexit
 import mimetypes
+import socket
+import sys
+import webbrowser
+from threading import Thread
 
 from flask import Flask, jsonify, render_template, request
 from kazoo import exceptions as zk_errors
 from kazoo.handlers.threading import KazooTimeoutError
 from werkzeug.exceptions import HTTPException
+from werkzeug.serving import ThreadedWSGIServer
 
 from zk_service import (
     CALL_TIMEOUT,
     ApiError,
     ConnectionManager,
     child_path,
+    convert_node_data,
     describe_node,
     import_batches,
     import_manifest,
     node_data,
     node_version,
     plan_import,
+    plan_subtree_delete,
     search_nodes,
+    subtree_delete_batches,
     znode_path,
 )
 
@@ -89,6 +97,27 @@ def zookeeper_error_response(error, *, write=False):
     return code, status
 
 
+def commit_transaction(connection, transaction, paths, root, **progress):
+    try:
+        connections.require(connection.id)
+        results = transaction.commit_async().get(CALL_TIMEOUT)
+    except ApiError as exc:
+        raise ApiError(exc.code, exc.status, path=root, **progress) from exc
+    except (zk_errors.KazooException, KazooTimeoutError) as exc:
+        code, status = zookeeper_error_response(exc, write=True)
+        raise ApiError(code, status, path=root, **progress) from exc
+
+    errors = [(path, result) for path, result in zip(paths, results) if isinstance(result, Exception)]
+    if errors:
+        path, error = next(
+            ((path, error) for path, error in errors
+             if not isinstance(error, (zk_errors.RolledBackError, zk_errors.RuntimeInconsistency))),
+            errors[0],
+        )
+        code, status = zookeeper_error_response(error, write=True)
+        raise ApiError(code, status, path=path, **progress)
+
+
 @app.errorhandler(KazooTimeoutError)
 @app.errorhandler(zk_errors.KazooException)
 def kazoo_error(error):
@@ -127,7 +156,7 @@ def index():
 
 @app.get("/api/connection")
 def connection_status():
-    return jsonify(connections.status())
+    return jsonify({**connections.status(), "history": connections.recent_hosts()})
 
 
 @app.post("/api/connection")
@@ -148,7 +177,8 @@ def list_children():
     connection = connections.require(connection_id())
     path = znode_path(request.args.get("path", "/"))
     names = connection.client.get_children_async(path).get(CALL_TIMEOUT)
-    return jsonify(children=[{"name": name, "path": child_path(path, name)} for name in sorted(names)])
+    ordered_names = sorted(names, key=lambda name: (name.casefold(), name))
+    return jsonify(children=[{"name": name, "path": child_path(path, name)} for name in ordered_names])
 
 
 @app.get("/api/node")
@@ -157,6 +187,11 @@ def get_node():
     path = znode_path(request.args.get("path"))
     data, stat = connection.client.get_async(path).get(CALL_TIMEOUT)
     return jsonify(describe_node(connection, path, data, stat))
+
+
+@app.post("/api/node/encoding")
+def convert_node_encoding():
+    return jsonify(value=convert_node_data(json_object()))
 
 
 @app.post("/api/node")
@@ -193,8 +228,34 @@ def delete_node():
     if path == "/":
         raise ApiError("protected_path", 403)
     connection.check_write_path(path)
-    connection.client.delete_async(path, version=node_version(payload)).get(CALL_TIMEOUT)
-    return jsonify(path=path)
+    version = node_version(payload)
+    recursive = payload.get("recursive", False)
+    if type(recursive) is not bool:
+        raise ApiError("invalid_request")
+    client = connection.client
+    if not recursive:
+        client.delete_async(path, version=version).get(CALL_TIMEOUT)
+        return jsonify(path=path)
+
+    try:
+        changes = plan_subtree_delete(client, path, version)
+    except (zk_errors.KazooException, KazooTimeoutError) as exc:
+        code, status = zookeeper_error_response(exc)
+        raise ApiError(code, status, path=path) from exc
+
+    deleted = 0
+    for batch in subtree_delete_batches(client, changes):
+        transaction = client.transaction()
+        operation_paths = []
+        if batch[-1][0] != path:
+            transaction.check(path, version)
+            operation_paths.append(path)
+        for target, expected_version in batch:
+            transaction.delete(target, version=expected_version)
+            operation_paths.append(target)
+        commit_transaction(connection, transaction, operation_paths, path, deleted=deleted)
+        deleted += len(batch)
+    return jsonify(path=path, deleted=deleted)
 
 
 @app.post("/api/import")
@@ -211,23 +272,10 @@ def upload_tree():
                 transaction.create(change.path, change.data)
             else:
                 transaction.set_data(change.path, change.data, version=change.version)
-        try:
-            connections.require(connection.id)
-            results = transaction.commit_async().get(CALL_TIMEOUT)
-        except ApiError as exc:
-            raise ApiError(exc.code, exc.status, path=root, created=created, updated=updated) from exc
-        except (zk_errors.KazooException, KazooTimeoutError) as exc:
-            code, status = zookeeper_error_response(exc, write=True)
-            raise ApiError(code, status, path=root, created=created, updated=updated) from exc
-        errors = [(index, result) for index, result in enumerate(results) if isinstance(result, Exception)]
-        if errors:
-            index, error = next(
-                ((index, error) for index, error in errors
-                 if not isinstance(error, (zk_errors.RolledBackError, zk_errors.RuntimeInconsistency))),
-                errors[0],
-            )
-            code, status = zookeeper_error_response(error, write=True)
-            raise ApiError(code, status, path=batch[index].path, created=created, updated=updated)
+        commit_transaction(
+            connection, transaction, [change.path for change in batch], root,
+            created=created, updated=updated,
+        )
         created += sum(change.version is None for change in batch)
         updated += sum(change.version is not None for change in batch)
     return jsonify(path=root, created=created, updated=updated, unchanged=len(targets) - len(changes))
@@ -241,13 +289,44 @@ def search():
     after = request.args.get("after")
     if not query and not leaves_only:
         raise ApiError("empty_search")
+    root = znode_path(request.args.get("root", "/"))
     if after is not None:
         after = znode_path(after)
-    return jsonify(search_nodes(connection.client, query, leaves_only, after))
+    return jsonify(search_nodes(connection.client, query, leaves_only, after, root=root))
+
+
+class LocalHTTPServer(ThreadedWSGIServer):
+    allow_reuse_address = not hasattr(socket, "SO_EXCLUSIVEADDRUSE")
+
+    def server_bind(self):
+        # Windows SO_REUSEADDR can let two instances listen on the same port.
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def main():
+    packaged = getattr(sys, "frozen", False)
+    parser = argparse.ArgumentParser(description="Local ZooKeeper Web client")
+    parser.add_argument(
+        "--port", type=int, default=0 if packaged else 8765,
+        help="local port (default: %(default)s; 0 selects a free port)",
+    )
+    if packaged:
+        parser.add_argument("--no-browser", action="store_true", help="skip opening the browser")
+    args = parser.parse_args()
+    if not 0 <= args.port <= 65535:
+        parser.error("--port must be between 0 and 65535")
+
+    host = "127.0.0.1"
+    with LocalHTTPServer(host, args.port, app) as server:
+        url = f"http://{host}:{server.server_port}/"
+        print(f"Running on {url}", flush=True)
+        print("Press Ctrl+C to stop.", flush=True)
+        if packaged and not args.no_browser:
+            Thread(target=webbrowser.open, args=(url,), daemon=True).start()
+        server.serve_forever()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Local ZooKeeper Web client")
-    parser.add_argument("--port", type=int, default=8765)
-    args = parser.parse_args()
-    app.run(host="127.0.0.1", port=args.port, use_reloader=False)
+    main()

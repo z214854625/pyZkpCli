@@ -1,13 +1,22 @@
 import base64
 import binascii
+import os
 import re
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import islice
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Optional
 from urllib.parse import urlsplit
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from kazoo.client import KazooClient
 from kazoo.exceptions import NoAuthError, NoNodeError
@@ -15,14 +24,17 @@ from kazoo.handlers.threading import KazooTimeoutError
 from kazoo.security import CREATOR_ALL_ACL
 
 CALL_TIMEOUT = 5
+CONNECTION_HISTORY_LIMIT = 10
 SEARCH_SCAN_LIMIT = 1000
 SEARCH_RESULT_LIMIT = 100
 MAX_DATA_BYTES = 1024 * 1024
 IMPORT_NODE_LIMIT = 4096
-IMPORT_PACKET_LIMIT = MAX_DATA_BYTES - 64
-IMPORT_READ_WINDOW = 64
+TRANSACTION_PACKET_LIMIT = MAX_DATA_BYTES - 64
+TREE_READ_WINDOW = 64
 INVALID_PATH_CHAR = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\uf8ff\ufff0-\U0010ffff]")
 NON_TEXT_CHAR = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f-\x9f]")
+NODE_TEXT_ENCODINGS = {"utf8": "utf-8", "gbk": "gbk"}
+NODE_DATA_ENCODINGS = ("base64", *NODE_TEXT_ENCODINGS)
 
 
 class ApiError(Exception):
@@ -68,6 +80,68 @@ def connection_string(value):
     return ",".join(endpoints) + (znode_path(f"/{root}") if separator else "")
 
 
+class ConnectionHistory:
+    def __init__(self):
+        user_data = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME")
+        default_dir = Path(user_data or Path.home() / ".local" / "share") / "pyZkpCli"
+        self.path = Path(os.environ.get("PYZKPCLI_DATA_DIR") or default_dir) / "connection_history.txt"
+
+    @contextmanager
+    def _locked(self):
+        # Both launchers use this sidecar so replacing the history does not replace the lock.
+        with self.path.with_suffix(".lock").open("a+b") as lock:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            yield
+
+    def _read(self):
+        recent = []
+        try:
+            with self.path.open("rb") as file:
+                for line in file:
+                    try:
+                        hosts = connection_string(line.decode("utf-8-sig").rstrip("\r\n"))
+                    except (ApiError, UnicodeDecodeError):
+                        continue
+                    if hosts not in recent:
+                        recent.append(hosts)
+                        if len(recent) == CONNECTION_HISTORY_LIMIT:
+                            break
+        except FileNotFoundError:
+            pass
+        return recent
+
+    def read(self):
+        try:
+            with self._locked():
+                return self._read()
+        except FileNotFoundError:
+            return []
+
+    def remember(self, hosts):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._locked():
+            recent = [hosts]
+            recent.extend(entry for entry in self._read() if entry != hosts)
+            del recent[CONNECTION_HISTORY_LIMIT:]
+
+            pending = None
+            try:
+                with NamedTemporaryFile(
+                    mode="w", encoding="utf-8", newline="\n", dir=self.path.parent, delete=False
+                ) as file:
+                    pending = Path(file.name)
+                    file.writelines(f"{entry}\n" for entry in recent)
+                pending.replace(self.path)
+            finally:
+                if pending is not None:
+                    pending.unlink(missing_ok=True)
+            return recent
+
+
 @dataclass(frozen=True)
 class Connection:
     id: str
@@ -88,6 +162,7 @@ class ConnectionManager:
     def __init__(self):
         self._active = None
         self._transition = threading.Lock()
+        self._history = ConnectionHistory()
 
     def status(self):
         active = self._active
@@ -99,6 +174,12 @@ class ConnectionManager:
             "state": "connected" if active.client.connected else "reconnecting",
             "authenticated": active.authenticated,
         }
+
+    def recent_hosts(self):
+        try:
+            return self._history.read()
+        except OSError:
+            return None
 
     def connect(self, hosts, username, password, expected_id):
         hosts = connection_string(hosts)
@@ -128,7 +209,12 @@ class ConnectionManager:
                 close_client(client)
                 raise
             self._replace(Connection(uuid.uuid4().hex, hosts, client, bool(auth_data)))
-            return self.status()
+            status = self.status()
+            try:
+                status["history"] = self._history.remember(hosts)
+            except (OSError, UnicodeError):
+                status["history_save_failed"] = True
+            return status
 
     def disconnect(self, expected_id):
         with self._transition:
@@ -167,18 +253,41 @@ def close_client(client):
 def node_data(payload):
     value = payload.get("value", "")
     encoding = payload.get("encoding", "utf8")
-    if not isinstance(value, str) or encoding not in ("utf8", "base64"):
+    if not isinstance(value, str) or encoding not in NODE_DATA_ENCODINGS:
         raise ApiError("invalid_data")
     try:
         if encoding == "base64":
             data = base64.b64decode("".join(value.split()), validate=True)
         else:
-            data = value.encode("utf-8")
+            data = value.encode(NODE_TEXT_ENCODINGS[encoding])
     except (ValueError, binascii.Error) as exc:
         raise ApiError("invalid_data") from exc
     if len(data) > MAX_DATA_BYTES:
         raise ApiError("data_too_large", 413)
     return data
+
+
+def node_data_value(data, encoding):
+    if encoding == "base64":
+        return base64.b64encode(data).decode("ascii")
+    codec = NODE_TEXT_ENCODINGS[encoding]
+    try:
+        text = data.decode(codec)
+        if not NON_TEXT_CHAR.search(text) and text.encode(codec) == data:
+            return text
+    except UnicodeError:
+        pass
+    return None
+
+
+def convert_node_data(payload):
+    target = payload.get("target_encoding")
+    if target not in NODE_DATA_ENCODINGS:
+        raise ApiError("invalid_data")
+    value = node_data_value(node_data(payload), target)
+    if value is None:
+        raise ApiError("invalid_text")
+    return value
 
 
 def node_version(payload):
@@ -188,6 +297,56 @@ def node_version(payload):
     return version
 
 
+def plan_subtree_delete(client, root, version):
+    pending_paths = [root]
+    changes = []
+    while pending_paths:
+        paths = pending_paths[-TREE_READ_WINDOW:]
+        del pending_paths[-TREE_READ_WINDOW:]
+        reads = [client.get_children_async(path, include_data=True) for path in paths]
+        for path, read in zip(paths, reads):
+            try:
+                names, stat = read.get(CALL_TIMEOUT)
+            except NoNodeError as exc:
+                raise ApiError("node_missing", 404, path=path) from exc
+            except NoAuthError as exc:
+                raise ApiError("permission_denied", 403, path=path) from exc
+            if path == root and stat.version != version:
+                raise ApiError("version_conflict", 409, path=path)
+            changes.append((path, stat.version))
+            pending_paths.extend(child_path(path, name) for name in names)
+
+    # A parent is visited before its children and must be deleted after them.
+    changes.reverse()
+    return changes
+
+
+def subtree_delete_batches(client, changes):
+    root, _ = changes[-1]
+    prefix_size = len(client.chroot.encode("utf-8"))
+    # Each batch includes the root, either to check its version or to delete it.
+    limit = TRANSACTION_PACKET_LIMIT - write_operation_size(root, None, prefix_size)
+    if limit < 0:
+        raise ApiError("delete_path_too_large", 413, path=root)
+
+    batches = []
+    batch = []
+    batch_size = 0
+    for change in islice(changes, len(changes) - 1):
+        path, _ = change
+        size = write_operation_size(path, None, prefix_size)
+        if size > limit:
+            raise ApiError("delete_path_too_large", 413, path=path)
+        if batch_size + size > limit:
+            batches.append(batch)
+            batch, batch_size = [], 0
+        batch.append(change)
+        batch_size += size
+    batch.append(changes[-1])
+    batches.append(batch)
+    return batches
+
+
 @dataclass(frozen=True)
 class ImportChange:
     path: str
@@ -195,7 +354,7 @@ class ImportChange:
     version: Optional[int]
 
 
-def import_packet_size(path, data, prefix_size):
+def write_operation_size(path, data, prefix_size):
     # Allow for the request headers, path fields, and default ACL.
     return prefix_size + len(path.encode("utf-8")) + len(data or b"") + 64
 
@@ -208,7 +367,7 @@ def import_manifest(connection, payload):
     root = znode_path(child_path(parent, name))
     connection.check_write_path(root)
     prefix_size = len(connection.client.chroot.encode("utf-8"))
-    if import_packet_size(root, None, prefix_size) > IMPORT_PACKET_LIMIT:
+    if write_operation_size(root, None, prefix_size) > TRANSACTION_PACKET_LIMIT:
         raise ApiError("invalid_path", path=root)
     directories, files = payload.get("directories"), payload.get("files")
     if not isinstance(directories, list) or not isinstance(files, list):
@@ -224,7 +383,7 @@ def import_manifest(connection, payload):
             znode_path(path)
         except ApiError as exc:
             raise ApiError(exc.code, exc.status, path=path) from exc
-        if import_packet_size(path, None, prefix_size) > IMPORT_PACKET_LIMIT:
+        if write_operation_size(path, None, prefix_size) > TRANSACTION_PACKET_LIMIT:
             raise ApiError("invalid_path", path=path)
         return path
 
@@ -242,7 +401,7 @@ def import_manifest(connection, payload):
         except ApiError as exc:
             code = "import_file_too_large" if exc.status == 413 else exc.code
             raise ApiError(code, exc.status, path=path) from exc
-        if import_packet_size(path, data, prefix_size) > IMPORT_PACKET_LIMIT:
+        if write_operation_size(path, data, prefix_size) > TRANSACTION_PACKET_LIMIT:
             raise ApiError("import_file_too_large", 413, path=path)
         targets[path] = data
 
@@ -277,7 +436,7 @@ def plan_import(client, parent, targets):
     changes = []
     # All paths are checked before any transaction. Read ahead to avoid one RTT per file.
     paths = iter(sorted(targets, key=lambda path: (path.count("/"), path)))
-    while window := list(islice(paths, IMPORT_READ_WINDOW)):
+    while window := list(islice(paths, TREE_READ_WINDOW)):
         reads = [
             client.exists_async(path) if targets[path] is None else client.get_async(path)
             for path in window
@@ -315,8 +474,8 @@ def import_batches(client, changes):
     batch_size = 0
     prefix_size = len(client.chroot.encode("utf-8"))
     for change in changes:
-        size = import_packet_size(change.path, change.data, prefix_size)
-        if batch_size + size > IMPORT_PACKET_LIMIT:
+        size = write_operation_size(change.path, change.data, prefix_size)
+        if batch_size + size > TRANSACTION_PACKET_LIMIT:
             batches.append(batch)
             batch, batch_size = [], 0
         batch.append(change)
@@ -328,15 +487,14 @@ def import_batches(client, changes):
 
 def describe_node(connection, path, data, stat):
     data = data if data is not None else b""
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        text = None
-    if text is None or NON_TEXT_CHAR.search(text):
+    encoding = "utf8"
+    value = node_data_value(data, encoding)
+    if value is None and path.lower().endswith(".ini"):
+        encoding = "gbk"
+        value = node_data_value(data, encoding)
+    if value is None:
         encoding = "base64"
-        value = base64.b64encode(data).decode("ascii")
-    else:
-        encoding, value = "utf8", text
+        value = node_data_value(data, encoding)
     return {
         "path": path,
         "name": path.rsplit("/", 1)[-1] or "/",
@@ -352,12 +510,15 @@ def describe_node(connection, path, data, stat):
     }
 
 
-def search_nodes(client, query, leaves_only, after):
+def search_nodes(client, query, leaves_only, after, *, root="/"):
     query = query.casefold()
     match_path = "/" in query
+    root_components = tuple(root[1:].split("/")) if root != "/" else ()
     cursor = tuple(after[1:].split("/")) if after and after != "/" else ()
+    if after is not None and cursor[:len(root_components)] != root_components:
+        raise ApiError("invalid_path")
     deadline = time.monotonic() + CALL_TIMEOUT
-    stack = [("/", ())]
+    stack = [(root, root_components)]
     results = []
     scanned = inaccessible = 0
     last_visited = after
@@ -374,7 +535,7 @@ def search_nodes(client, query, leaves_only, after):
         except KazooTimeoutError:
             break
         except NoNodeError:
-            if path == "/":
+            if path == root:
                 raise
             stack.pop()
             continue
@@ -383,13 +544,17 @@ def search_nodes(client, query, leaves_only, after):
             inaccessible += 1
 
         stack.pop()
+        name = components[-1] if components else "/"
+        target = path if match_path else name
+        matched = leaf == leaves_only and (not query or query == target.casefold())
         if after is None or components > cursor:
             scanned += 1
             last_visited = path
-            name = components[-1] if components else "/"
-            if (not leaves_only or leaf is True) and query in (path if match_path else name).casefold():
+            if matched:
                 results.append({"path": path, "name": name, "leaf": leaf})
 
+        if matched:
+            continue
         for name in sorted(names, reverse=True):
             child_components = (*components, name)
             if child_components > cursor or child_components == cursor[: len(child_components)]:
