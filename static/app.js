@@ -6,6 +6,7 @@ const hostsInput = $("hosts");
 const historySelect = $("connection-history");
 const createDialog = $("create-dialog");
 const importDialog = $("import-dialog");
+const exportDialog = $("export-dialog");
 const deleteDialog = $("delete-dialog");
 const editor = $("editor");
 const valueInput = $("node-value");
@@ -45,6 +46,10 @@ const messages = {
   import_request_too_large: "本次上传超过 8 MiB 请求上限，请缩小所选目录。",
   import_file_too_large: "该文件与对应路径超过 ZooKeeper 单个请求的大小上限。",
   import_too_many_nodes: "一个目录最多导入 4096 个节点。",
+  export_invalid_name: "节点名无法用作本地文件或目录名。",
+  export_name_conflict: "同一目录下的节点名称在本地文件系统中可能冲突。",
+  export_tree_changed: "下载期间节点结构发生变化，请重新下载。",
+  export_incomplete: "下载中断，请重试。",
   network_error: "无法访问本地 Web 服务。",
 };
 
@@ -63,6 +68,7 @@ let draftValue = "";
 let lineEndingSource = "";
 let mutationBusy = false;
 let directoryImport = null;
+let exportTarget = null;
 let deleteTarget = null;
 let searchState = null;
 let notificationTimer;
@@ -78,10 +84,19 @@ function messageFor(error) {
   return messages[error.message] ?? "操作失败，请检查 ZooKeeper 服务后重试。";
 }
 
-async function api(route, { method = "GET", parameters, body } = {}) {
+function apiError(data) {
+  if (data.error === "connection_changed") void pollStatus();
+  const error = new Error(data.error);
+  error.details = data;
+  return error;
+}
+
+async function apiResponse(route, {
+  method = "GET", parameters, body, accept = "application/json", connectionId = connection.id, signal,
+} = {}) {
   const query = parameters ? `?${new URLSearchParams(parameters)}` : "";
-  const headers = { Accept: "application/json" };
-  if (connection.id) headers["X-ZK-Connection"] = connection.id;
+  const headers = { Accept: accept };
+  if (connectionId) headers["X-ZK-Connection"] = connectionId;
   if (method !== "GET") headers["Content-Type"] = "application/json";
   let response;
   try {
@@ -89,20 +104,21 @@ async function api(route, { method = "GET", parameters, body } = {}) {
       method,
       headers,
       body: method === "GET" ? undefined : JSON.stringify(body ?? {}),
+      signal,
       cache: "no-store",
     });
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     const localRequest = method === "GET" || route === "connection" || route === "node/encoding";
     throw new Error(localRequest ? "network_error" : "write_unconfirmed");
   }
-  const data = await response.json();
-  if (!response.ok) {
-    if (data.error === "connection_changed") void pollStatus();
-    const error = new Error(data.error);
-    error.details = data;
-    throw error;
-  }
-  return data;
+  if (!response.ok) throw apiError(await response.json());
+  return response;
+}
+
+async function api(route, options) {
+  const response = await apiResponse(route, options);
+  return response.json();
 }
 
 function setMessage(element, message) {
@@ -144,6 +160,8 @@ function updateControls() {
   $("search-leaf-hint").hidden = $("leaves").checked;
   $("submit-search").disabled = !canRead || !($("query").value.trim() || $("leaves").checked);
   $("open-create").disabled = !canEdit || node.ephemeral;
+  $("open-export").disabled = !canRead || node === null;
+  $("export-start").disabled = !canRead || exportTarget?.connectionId !== connection.id || !!exportTarget?.controller;
   const deleteButton = $("open-delete");
   deleteButton.disabled = !canEdit || node.path === "/";
   deleteButton.title = node?.num_children ? "删除子树" : "删除节点";
@@ -389,6 +407,15 @@ function clearSearch() {
   updateControls();
 }
 
+function compareLeafResults(first, second) {
+  const firstName = first.sort_name ?? first.name.toLowerCase();
+  const secondName = second.sort_name ?? second.name.toLowerCase();
+  if (firstName !== secondName) return firstName < secondName ? -1 : 1;
+  if (first.name !== second.name) return first.name < second.name ? -1 : 1;
+  if (first.path !== second.path) return first.path < second.path ? -1 : 1;
+  return 0;
+}
+
 async function runSearch(append = false) {
   if (!connected() || mutationBusy) return;
   if (!append) {
@@ -415,6 +442,7 @@ async function runSearch(append = false) {
       const page = await api("search", { parameters });
       if (searchState !== search) return;
       search.results.push(...page.nodes);
+      if (search.leaves === "1" && page.nodes.length) search.results.sort(compareLeafResults);
       search.after = page.after;
       search.scanned += page.scanned;
       search.inaccessible += page.inaccessible;
@@ -508,8 +536,11 @@ function renderNode() {
   $("empty-detail").hidden = true;
   $("node-detail").hidden = false;
   const root = node.path === "/";
+  const directory = root || node.num_children > 0;
   $("node-name").textContent = root ? "根节点" : node.name;
   $("node-kind").replaceChildren(icon(node.protected ? "lock-keyhole" : root || node.num_children ? "folder" : "file"));
+  $("export-action-icon").replaceChildren(icon(directory ? "folder-down" : "download"));
+  $("export-action-label").textContent = directory ? "下载目录" : "下载文件";
   $("node-kind").title = node.protected ? "系统节点" : node.ephemeral ? "临时节点" : "持久节点";
   $("node-path").textContent = node.path;
   $("meta-version").textContent = node.version;
@@ -977,6 +1008,144 @@ $("import-files")?.addEventListener("change", (event) => {
 $("import-form")?.addEventListener("submit", (event) => {
   event.preventDefault();
   void submitImport();
+});
+
+async function* exportRecords(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      buffer += decoder.decode(value, { stream: true });
+      let end;
+      while ((end = buffer.indexOf("\n")) !== -1) {
+        const record = JSON.parse(buffer.slice(0, end));
+        buffer = buffer.slice(end + 1);
+        if (record.error) throw apiError(record);
+        yield record;
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+function exportBytes(value) {
+  return Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
+}
+
+function saveExportZip(name, chunks) {
+  const url = URL.createObjectURL(new Blob(chunks, { type: "application/zip" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${name}.zip`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+
+function exportProgress(status, path = "") {
+  $("export-status").textContent = status;
+  const current = $("export-current");
+  current.textContent = path;
+  current.title = path;
+}
+
+async function submitExport() {
+  if ($("export-start").disabled) return;
+  const target = exportTarget;
+  const controller = new AbortController();
+  const { signal } = controller;
+  target.controller = controller;
+  const meter = $("export-meter");
+  meter.removeAttribute("value");
+  meter.hidden = false;
+  exportProgress("正在扫描节点…");
+  $("export-progress").hidden = false;
+  $("export-close").textContent = "取消下载";
+  $("export-close-icon").disabled = true;
+  setMessage($("export-error"), "");
+  updateControls();
+
+  const chunks = [];
+  let name;
+  let current = target.path;
+  let total = 0;
+  let completed = 0;
+  try {
+    const response = await apiResponse("export", {
+      parameters: { path: target.path, zip: "1" },
+      accept: "application/x-ndjson",
+      connectionId: target.connectionId,
+      signal,
+    });
+    for await (const record of exportRecords(response)) {
+      if (signal.aborted) throw signal.reason;
+      switch (record.type) {
+        case "scan":
+          exportProgress(`正在扫描节点，已发现 ${record.scanned} 个`);
+          break;
+        case "start":
+          name = record.name;
+          total = record.total;
+          meter.max = total;
+          meter.value = 0;
+          exportProgress(`正在打包 0 / ${total} 个节点`);
+          break;
+        case "entry":
+          current = record.path;
+          chunks.push(exportBytes(record.value));
+          meter.value = ++completed;
+          exportProgress(`已打包 ${completed} / ${total} 个节点`, current);
+          break;
+        case "done":
+          if (!total || completed !== total) throw new Error("export_incomplete");
+          chunks.push(exportBytes(record.value));
+          saveExportZip(name, chunks);
+          exportProgress("ZIP 已交给浏览器下载");
+          return;
+      }
+    }
+    throw new Error("export_incomplete");
+  } catch (error) {
+    if (signal.aborted) {
+      exportProgress("下载已取消");
+    } else {
+      const path = error.details?.path ?? current;
+      const reason = error instanceof TypeError ? messages.export_incomplete : messageFor(error);
+      exportProgress("");
+      setMessage($("export-error"), `（${path}）${reason}`);
+    }
+    meter.hidden = !total;
+  } finally {
+    target.controller = null;
+    $("export-close").textContent = "关闭";
+    $("export-close-icon").disabled = false;
+    updateControls();
+  }
+}
+
+$("open-export").addEventListener("click", () => {
+  exportTarget = { path: node.path, connectionId: connection.id, controller: null };
+  $("export-dialog-title").textContent = $("export-action-label").textContent;
+  $("export-path").textContent = node.path;
+  $("export-progress").hidden = true;
+  setMessage($("export-error"), "");
+  exportDialog.showModal();
+  updateControls();
+});
+$("export-start").addEventListener("click", () => { void submitExport(); });
+$("export-close-icon").addEventListener("click", () => exportDialog.close());
+$("export-close").addEventListener("click", () => {
+  if (exportTarget.controller) exportTarget.controller.abort();
+  else exportDialog.close();
+});
+exportDialog.addEventListener("cancel", (event) => {
+  if (!exportTarget?.controller) return;
+  event.preventDefault();
+  exportTarget.controller.abort();
 });
 
 $("open-delete").addEventListener("click", () => {

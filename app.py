@@ -1,12 +1,13 @@
 import argparse
 import atexit
+import json
 import mimetypes
 import socket
 import sys
 import webbrowser
 from threading import Thread
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 from kazoo import exceptions as zk_errors
 from kazoo.handlers.threading import KazooTimeoutError
 from werkzeug.exceptions import HTTPException
@@ -19,11 +20,14 @@ from zk_service import (
     child_path,
     convert_node_data,
     describe_node,
+    export_tree_events,
     import_batches,
     import_manifest,
     node_data,
+    node_name_key,
     node_version,
     plan_import,
+    plan_rename,
     plan_subtree_delete,
     search_nodes,
     subtree_delete_batches,
@@ -66,7 +70,7 @@ def check_origin():
         origin = request.headers.get("Origin")
         if origin is not None and origin != request.host_url.rstrip("/"):
             raise ApiError("origin_denied", 403)
-        if request.method in {"POST", "PUT", "DELETE"} and request.mimetype != "application/json":
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.mimetype != "application/json":
             raise ApiError("json_required", 415)
 
 
@@ -177,7 +181,7 @@ def list_children():
     connection = connections.require(connection_id())
     path = znode_path(request.args.get("path", "/"))
     names = connection.client.get_children_async(path).get(CALL_TIMEOUT)
-    ordered_names = sorted(names, key=lambda name: (name.casefold(), name))
+    ordered_names = sorted(names, key=node_name_key)
     return jsonify(children=[{"name": name, "path": child_path(path, name)} for name in ordered_names])
 
 
@@ -218,6 +222,36 @@ def update_node():
     data = node_data(payload)
     stat = connection.client.set_async(path, data, version=node_version(payload)).get(CALL_TIMEOUT)
     return jsonify(describe_node(connection, path, data, stat))
+
+
+@app.patch("/api/node")
+def rename_node():
+    connection = connections.require(connection_id())
+    payload = json_object()
+    path = znode_path(payload.get("path"))
+    if path == "/":
+        raise ApiError("protected_path", 403)
+    connection.check_write_path(path)
+    name = payload.get("name")
+    if not isinstance(name, str) or not name or "/" in name:
+        raise ApiError("invalid_name")
+    parent = path.rsplit("/", 1)[0] or "/"
+    destination = znode_path(child_path(parent, name))
+    connection.check_write_path(destination)
+    if destination == path:
+        raise ApiError("rename_same_name", 409)
+    version = node_version(payload)
+    created_zxid = payload.get("created_zxid")
+    if not isinstance(created_zxid, str):
+        raise ApiError("invalid_request")
+
+    try:
+        transaction, paths = plan_rename(connection.client, path, destination, version, created_zxid)
+    except (zk_errors.KazooException, KazooTimeoutError) as exc:
+        code, status = zookeeper_error_response(exc)
+        raise ApiError(code, status, path=path) from exc
+    commit_transaction(connection, transaction, paths, path)
+    return jsonify(path=destination)
 
 
 @app.delete("/api/node")
@@ -279,6 +313,28 @@ def upload_tree():
         created += sum(change.version is None for change in batch)
         updated += sum(change.version is not None for change in batch)
     return jsonify(path=root, created=created, updated=updated, unchanged=len(targets) - len(changes))
+
+
+@app.get("/api/export")
+def download_tree():
+    connection = connections.require(connection_id())
+    path = znode_path(request.args.get("path"))
+    as_zip = request.args.get("zip") == "1"
+
+    def check_connection():
+        connections.require(connection.id)
+
+    def stream():
+        try:
+            for event in export_tree_events(connection.client, path, check_connection, as_zip=as_zip):
+                yield json.dumps(event, separators=(",", ":")) + "\n"
+        except ApiError as error:
+            yield json.dumps({"error": error.code, **error.details}) + "\n"
+        except (zk_errors.KazooException, KazooTimeoutError) as error:
+            code, _ = zookeeper_error_response(error)
+            yield json.dumps({"error": code, "path": path}) + "\n"
+
+    return Response(stream(), mimetype="application/x-ndjson")
 
 
 @app.get("/api/search")

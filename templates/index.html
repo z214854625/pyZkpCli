@@ -97,6 +97,9 @@
               {{ icon("folder-up") }}导入目录
             </button>
             {% endif %}
+            <button id="open-export" class="button" type="button" disabled>
+              <span id="export-action-icon">{{ icon("folder-down") }}</span><span id="export-action-label">下载目录</span>
+            </button>
             <button id="open-delete" class="icon-button outlined danger" type="button" aria-label="删除节点" title="删除节点">
               {{ icon("trash-2") }}
             </button>
@@ -226,6 +229,28 @@
     </form>
   </dialog>
   {% endif %}
+
+  <dialog id="export-dialog" aria-labelledby="export-dialog-title">
+    <div class="dialog-header">
+      <h2 id="export-dialog-title">下载目录</h2>
+      <button id="export-close-icon" class="icon-button" type="button" aria-label="关闭" title="关闭">{{ icon("x") }}</button>
+    </div>
+    <div class="dialog-body">
+      <div id="export-path" class="path-preview mono"></div>
+      <div id="export-progress" class="export-progress" hidden>
+        <progress id="export-meter" aria-label="下载进度"></progress>
+        <p id="export-status" role="status"></p>
+        <p id="export-current" class="mono muted"></p>
+      </div>
+      <p id="export-error" class="form-error" role="alert" hidden></p>
+    </div>
+    <div class="dialog-footer">
+      <button id="export-close" class="button" type="button">关闭</button>
+      <button id="export-start" class="button primary" type="button" autofocus>
+        {{ icon("download") }}下载 ZIP
+      </button>
+    </div>
+  </dialog>
 
   <dialog id="delete-dialog" aria-labelledby="delete-dialog-title">
     <form id="delete-form">

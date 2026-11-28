@@ -5,13 +5,16 @@ import re
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from collections import deque
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Optional
+from unicodedata import normalize
 from urllib.parse import urlsplit
+from zipfile import ZIP_DEFLATED, ZipFile
 
 if os.name == "nt":
     import msvcrt
@@ -21,6 +24,7 @@ else:
 from kazoo.client import KazooClient
 from kazoo.exceptions import NoAuthError, NoNodeError
 from kazoo.handlers.threading import KazooTimeoutError
+from kazoo.protocol.serialization import Create, Delete, multiheader_struct
 from kazoo.security import CREATOR_ALL_ACL
 
 CALL_TIMEOUT = 5
@@ -31,7 +35,10 @@ MAX_DATA_BYTES = 1024 * 1024
 IMPORT_NODE_LIMIT = 4096
 TRANSACTION_PACKET_LIMIT = MAX_DATA_BYTES - 64
 TREE_READ_WINDOW = 64
+TREE_DATA_READ_WINDOW = 8
 INVALID_PATH_CHAR = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\uf8ff\ufff0-\U0010ffff]")
+INVALID_EXPORT_NAME_CHAR = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+RESERVED_EXPORT_NAME = re.compile(r"(?:CON|PRN|AUX|NUL|(?:COM|LPT)[1-9\u00b9\u00b2\u00b3]|CON(?:IN|OUT)\$)")
 NON_TEXT_CHAR = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f-\x9f]")
 NODE_TEXT_ENCODINGS = {"utf8": "utf-8", "gbk": "gbk"}
 NODE_DATA_ENCODINGS = ("base64", *NODE_TEXT_ENCODINGS)
@@ -58,6 +65,10 @@ def znode_path(value):
 
 def child_path(parent, name):
     return f"{parent.rstrip('/')}/{name}"
+
+
+def node_name_key(name):
+    return name.casefold(), name
 
 
 def connection_string(value):
@@ -297,6 +308,17 @@ def node_version(payload):
     return version
 
 
+def read_node_result(read, path):
+    try:
+        return read.get(CALL_TIMEOUT)
+    except NoNodeError as exc:
+        raise ApiError("node_missing", 404, path=path) from exc
+    except NoAuthError as exc:
+        raise ApiError("permission_denied", 403, path=path) from exc
+    except KazooTimeoutError as exc:
+        raise ApiError("timeout", 504, path=path) from exc
+
+
 def plan_subtree_delete(client, root, version):
     pending_paths = [root]
     changes = []
@@ -345,6 +367,66 @@ def subtree_delete_batches(client, changes):
     batch.append(changes[-1])
     batches.append(batch)
     return batches
+
+
+def plan_rename(client, source, destination, version, created_zxid):
+    if read_node_result(client.exists_async(destination), destination) is not None:
+        raise ApiError("node_exists", 409, path=destination)
+
+    pending = deque([source])
+    snapshots = []
+    creates = []
+    deletes = []
+    packet_size = multiheader_struct.size
+    chroot = client.chroot.rstrip("/")
+    session_id = client.client_id[0]
+
+    while pending:
+        paths = [pending.popleft() for _ in range(min(len(pending), TREE_DATA_READ_WINDOW))]
+        reads = [
+            (client.get_async(path), client.get_children_async(path, include_data=True), client.get_acls_async(path))
+            for path in paths
+        ]
+        for path, (data_read, children_read, acl_read) in zip(paths, reads):
+            data, stat = read_node_result(data_read, path)
+            if path == source and (stat.version != version or str(stat.czxid) != created_zxid):
+                raise ApiError("version_conflict", 409, path=path)
+            if stat.ephemeralOwner and stat.ephemeralOwner != session_id:
+                raise ApiError("rename_ephemeral", 409, path=path)
+
+            names, children_stat = read_node_result(children_read, path)
+            acls, acl_stat = read_node_result(acl_read, path)
+            if children_stat != stat or acl_stat != stat:
+                raise ApiError("version_conflict", 409, path=path)
+            if any(acl.id.scheme == "digest" and acl.id.id.endswith(":x") for acl in acls):
+                raise ApiError("rename_acl_masked", 403, path=path)
+
+            target = destination + path[len(source):]
+            # Use the wire operations to preserve null data and measure the full request.
+            create = Create(chroot + target, data, acls, int(bool(stat.ephemeralOwner)))
+            delete = Delete(chroot + path, stat.version)
+            packet_size += len(create.serialize()) + len(delete.serialize()) + 2 * multiheader_struct.size
+            if packet_size > TRANSACTION_PACKET_LIMIT:
+                raise ApiError("rename_too_large", 413, path=source)
+            creates.append(create)
+            deletes.append(delete)
+            snapshots.append((path, target, stat))
+            pending.extend(child_path(path, name) for name in names)
+
+    # Recheck identity, children and ACL versions before the versioned deletes.
+    remaining = iter(snapshots)
+    while window := list(islice(remaining, TREE_READ_WINDOW)):
+        reads = [client.exists_async(path) for path, _, _ in window]
+        for (path, _, stat), read in zip(window, reads):
+            if read_node_result(read, path) != stat:
+                raise ApiError("version_conflict", 409, path=path)
+
+    transaction = client.transaction()
+    transaction.operations.extend(creates)
+    transaction.operations.extend(reversed(deletes))
+    operation_paths = [target for _, target, _ in snapshots]
+    operation_paths.extend(path for path, _, _ in reversed(snapshots))
+    return transaction, operation_paths
 
 
 @dataclass(frozen=True)
@@ -485,6 +567,107 @@ def import_batches(client, changes):
     return batches
 
 
+@dataclass(frozen=True)
+class ExportEntry:
+    path: str
+    relative: str
+    directory: bool
+    czxid: int
+
+
+def check_export_name(name, path):
+    device = name.split(".", 1)[0].rstrip(" ").upper()
+    if (
+        not name
+        or name.endswith((".", " "))
+        or INVALID_EXPORT_NAME_CHAR.search(name)
+        or RESERVED_EXPORT_NAME.fullmatch(device)
+    ):
+        raise ApiError("export_invalid_name", path=path)
+
+
+def scan_export_tree(client, root, name, check_connection):
+    pending = deque([(root, name)])
+    while pending:
+        check_connection()
+        window = [pending.popleft() for _ in range(min(len(pending), TREE_READ_WINDOW))]
+        reads = [client.get_children_async(path, include_data=True) for path, _ in window]
+        batch = []
+        for (path, relative), read in zip(window, reads):
+            names, stat = read_node_result(read, path)
+            batch.append(ExportEntry(path, relative, bool(names) or path == "/", stat.czxid))
+            local_names = set()
+            for child in sorted(names, key=node_name_key):
+                target = child_path(path, child)
+                check_export_name(child, target)
+                local_name = normalize("NFC", child).casefold()
+                if local_name in local_names:
+                    raise ApiError("export_name_conflict", 409, path=target)
+                local_names.add(local_name)
+                pending.append((target, f"{relative}/{child}"))
+        yield batch
+
+
+def read_export_entries(client, entries, check_connection):
+    pending = iter(entries)
+    while window := list(islice(pending, TREE_DATA_READ_WINDOW)):
+        check_connection()
+        reads = [None if entry.directory else client.get_async(entry.path) for entry in window]
+        for entry, read in zip(window, reads):
+            data = None
+            if read is not None:
+                data, stat = read_node_result(read, entry.path)
+                if stat.numChildren or stat.czxid != entry.czxid:
+                    raise ApiError("export_tree_changed", 409, path=entry.path)
+                data = data or b""
+            yield entry, data
+
+
+class ExportZipBuffer:
+    # ZipFile tracks its own position when writing to an unseekable stream.
+    def __init__(self):
+        self.buffer = bytearray()
+
+    def write(self, data):
+        self.buffer.extend(data)
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def take(self):
+        data = node_data_value(self.buffer, "base64")
+        self.buffer.clear()
+        return data
+
+
+def export_tree_events(client, root, check_connection, *, as_zip=False):
+    name = root.rsplit("/", 1)[-1] or "zookeeper"
+    check_export_name(name, root)
+    entries = []
+    yield {"type": "scan", "scanned": 0}
+    for batch in scan_export_tree(client, root, name, check_connection):
+        entries.extend(batch)
+        yield {"type": "scan", "scanned": len(entries)}
+    yield {"type": "start", "total": len(entries), "name": name}
+
+    output = ExportZipBuffer() if as_zip else None
+    with ZipFile(output, "w", compression=ZIP_DEFLATED) if as_zip else nullcontext() as archive:
+        for entry, data in read_export_entries(client, entries, check_connection):
+            if archive is not None:
+                filename = f"{entry.relative}/" if entry.directory else entry.relative
+                archive.writestr(filename, data or b"")
+                value = output.take()
+            else:
+                value = None if entry.directory else node_data_value(data, "base64")
+            yield {
+                "type": "entry", "path": entry.path, "relative": entry.relative,
+                "directory": entry.directory, "value": value,
+            }
+    check_connection()
+    yield {"type": "done", "value": output.take() if as_zip else None}
+
+
 def describe_node(connection, path, data, stat):
     data = data if data is not None else b""
     encoding = "utf8"
@@ -501,6 +684,7 @@ def describe_node(connection, path, data, stat):
         "value": value,
         "encoding": encoding,
         "version": stat.version,
+        "created_zxid": str(stat.czxid),
         "data_length": stat.dataLength,
         "num_children": stat.numChildren,
         "created_at": stat.ctime,
@@ -551,7 +735,10 @@ def search_nodes(client, query, leaves_only, after, *, root="/"):
             scanned += 1
             last_visited = path
             if matched:
-                results.append({"path": path, "name": name, "leaf": leaf})
+                result = {"path": path, "name": name, "leaf": leaf}
+                if leaves_only:
+                    result["sort_name"] = name.casefold()
+                results.append(result)
 
         if matched:
             continue
